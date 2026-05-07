@@ -1,60 +1,192 @@
 import './style.css'
-import typescriptLogo from './assets/typescript.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import { setupCounter } from './counter.ts'
+import { resizeCanvas } from './utils/canvas'
+import { createInitialState, getWordsForWave } from './GameState'
+import type { GameState } from './GameState'
+import { GameLoop } from './GameLoop'
+import { StarField } from './systems/StarField'
+import { EnemyManager } from './systems/EnemyManager'
+import { ParticleSystem } from './systems/ParticleSystem'
+import { DifficultyEngine } from './systems/DifficultyEngine'
+import { AudioManager } from './systems/AudioManager'
+import { Renderer } from './Renderer'
+import { SETTINGS } from './config/settings'
+import type { InputEvent } from './systems/InputHandler'
 
-document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
-<section id="center">
-  <div class="hero">
-    <img src="${heroImg}" class="base" width="170" height="179">
-    <img src="${typescriptLogo}" class="framework" alt="TypeScript logo"/>
-    <img src="${viteLogo}" class="vite" alt="Vite logo" />
-  </div>
-  <div>
-    <h1>Get started</h1>
-    <p>Edit <code>src/main.ts</code> and save to test <code>HMR</code></p>
-  </div>
-  <button id="counter" type="button" class="counter"></button>
-</section>
+const canvas = document.getElementById('game-canvas') as HTMLCanvasElement
+const ctx = canvas.getContext('2d')!
 
-<div class="ticks"></div>
+let state: GameState = createInitialState()
 
-<section id="next-steps">
-  <div id="docs">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon"></use></svg>
-    <h2>Documentation</h2>
-    <p>Your questions, answered</p>
-    <ul>
-      <li>
-        <a href="https://vite.dev/" target="_blank">
-          <img class="logo" src="${viteLogo}" alt="" />
-          Explore Vite
-        </a>
-      </li>
-      <li>
-        <a href="https://www.typescriptlang.org" target="_blank">
-          <img class="button-icon" src="${typescriptLogo}" alt="">
-          Learn more
-        </a>
-      </li>
-    </ul>
-  </div>
-  <div id="social">
-    <svg class="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#social-icon"></use></svg>
-    <h2>Connect with us</h2>
-    <p>Join the Vite community</p>
-    <ul>
-      <li><a href="https://github.com/vitejs/vite" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#github-icon"></use></svg>GitHub</a></li>
-      <li><a href="https://chat.vite.dev/" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#discord-icon"></use></svg>Discord</a></li>
-      <li><a href="https://x.com/vite_js" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#x-icon"></use></svg>X.com</a></li>
-      <li><a href="https://bsky.app/profile/vite.dev" target="_blank"><svg class="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#bluesky-icon"></use></svg>Bluesky</a></li>
-    </ul>
-  </div>
-</section>
+const starField = new StarField()
+const particleSystem = new ParticleSystem()
+const difficultyEngine = new DifficultyEngine()
+const renderer = new Renderer(ctx)
+const audioManager = new AudioManager()
+audioManager.init('/audio/background.mp3')
 
-<div class="ticks"></div>
-<section id="spacer"></section>
-`
+function onInputEvent(event: InputEvent): void {
+  switch (event.type) {
+    case 'word_completed': {
+      const enemy = event.enemy
+      const comboBonus = Math.floor(state.combo / 3)
+      const wordScore = enemy.word.length + comboBonus
 
-setupCounter(document.querySelector<HTMLButtonElement>('#counter')!)
+      state.score += wordScore
+      state.combo += 1
+      state.bestCombo = Math.max(state.bestCombo, state.combo)
+      state.wordsDestroyed += 1
+      state.wordsCompletedInWave += 1
+
+      // count the final letter that completed the word
+      state.correctKeystrokes += 1
+      state.keystrokes += 1
+
+      particleSystem.spawnExplosion(enemy.x, enemy.y, enemy.size)
+      renderer.triggerLaser(
+        SETTINGS.canvasWidth / 2,
+        SETTINGS.canvasHeight - 40,
+        enemy.x,
+        enemy.y,
+      )
+      enemyManager.removeEnemy(enemy.id)
+      break
+    }
+
+    case 'letter_correct': {
+      state.correctKeystrokes += 1
+      state.keystrokes += 1
+      break
+    }
+
+    case 'letter_wrong': {
+      state.keystrokes += 1
+      // no correctKeystrokes increment — this is the accuracy penalty
+      state.combo = 0
+      break
+    }
+
+    case 'no_target': {
+      // deliberately not counted — pressing a key with no valid
+      // target is not a typing mistake, it's a game state issue
+      break
+    }
+  }
+}
+
+const enemyManager = new EnemyManager(onInputEvent)
+
+function startWave(): void {
+  state.wordsInWave = getWordsForWave(state.wave)
+  state.wordsCompletedInWave = 0
+  state.phase = 'playing'
+  enemyManager.startWave(state.wave)
+  enemyManager.start()
+}
+
+function update(dt: number): void {
+  starField.update(dt)
+
+  if (state.phase === 'idle') return
+  if (state.phase === 'wave_complete') return
+  if (state.phase === 'gameover') return
+  if (state.phase === 'paused') return
+
+  state.elapsedTime += dt * 1000
+  renderer.update(dt)
+  difficultyEngine.update(state, state.elapsedTime)
+
+  const { missed } = enemyManager.update(dt, state)
+
+  if (missed) {
+    state.combo = 0
+    state.wordsMissed += 1
+    state.lives -= 1
+
+    if (state.lives <= 0) {
+      state.phase = 'gameover'
+      enemyManager.stop()
+      return
+    }
+  }
+
+  if (enemyManager.isWaveComplete) {
+    state.phase = 'wave_complete'
+    enemyManager.stop()
+  }
+}
+
+function render(): void {
+  const W = SETTINGS.canvasWidth
+  const H = SETTINGS.canvasHeight
+
+  if (state.phase === 'idle') {
+    renderer.render(starField, [], null, particleSystem, state)
+    renderer.renderIdle(W, H)
+    return
+  }
+
+  if (state.phase === 'wave_complete') {
+    renderer.render(starField, [], null, particleSystem, state)
+    renderer.renderWaveComplete(state, W, H)
+    return
+  }
+
+  if (state.phase === 'gameover') {
+    renderer.render(starField, [], null, particleSystem, state)
+    renderer.renderGameOver(state, W, H)
+    return
+  }
+
+  renderer.render(
+    starField,
+    enemyManager.activeEnemies,
+    enemyManager.lockedEnemy,
+    particleSystem,
+    state,
+  )
+}
+
+function startGame(): void {
+  state = createInitialState()
+  difficultyEngine.reset()
+  enemyManager.reset()
+  startWave()
+}
+
+function nextWave(): void {
+  state.wave += 1
+  startWave()
+}
+
+function handleGlobalKey(e: KeyboardEvent): void {
+  if (e.key.length !== 1) return
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+
+  audioManager.resume()
+
+  if (state.phase === 'idle' || state.phase === 'gameover') {
+    startGame()
+    return
+  }
+
+  if (state.phase === 'wave_complete') {
+    nextWave()
+    return
+  }
+
+  if (state.phase === 'playing') {
+    enemyManager.queueKey(e.key.toLowerCase())
+  }
+}
+
+function handleResize(): void {
+  resizeCanvas(canvas, ctx)
+  starField.resize()
+}
+
+resizeCanvas(canvas, ctx)
+window.addEventListener('keydown', handleGlobalKey)
+window.addEventListener('resize', handleResize)
+
+const gameLoop = new GameLoop(update, render)
+gameLoop.start()
